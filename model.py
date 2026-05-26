@@ -26,6 +26,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import (
     GridSearchCV,
     StratifiedKFold,
+    train_test_split,
     cross_val_predict,
     cross_validate,
 )
@@ -47,6 +48,7 @@ N_CV_FOLDS = 5
 N_GRIDSEARCH_FOLDS = 3
 # Parallel workers can interleave stdout on Windows; keep at 1 for clean console output.
 N_JOBS = 1
+TEST_SIZE = 0.2
 
 # Per-axis: 5 time features + 4 frequency summary features
 N_TIME_FEATURES_PER_AXIS = 5
@@ -388,27 +390,44 @@ def report_results(
 
 def evaluate_final_model(
     pipeline: Pipeline,
-    X: np.ndarray,
-    y: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
     class_names: list[str],
     n_splits: int = N_CV_FOLDS,
 ) -> Pipeline:
-    """Report out-of-fold metrics, then refit on the full dataset for deployment."""
+    """
+    Evaluate on a held-out test set, then return a fitted pipeline.
+
+    Workflow:
+    - Cross-validated out-of-fold report on TRAIN only (sanity check)
+    - Fit on TRAIN
+    - Final evaluation on TEST (true hold-out)
+    """
     cv = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
         random_state=RANDOM_STATE,
     )
 
-    y_pred = cross_val_predict(pipeline, X, y, cv=cv, n_jobs=N_JOBS)
+    y_pred_oof = cross_val_predict(pipeline, X_train, y_train, cv=cv, n_jobs=N_JOBS)
     report_results(
-        y,
-        y_pred,
+        y_train,
+        y_pred_oof,
         class_names,
-        title=f"Out-of-fold predictions ({n_splits}-fold CV)",
+        title=f"Train set: out-of-fold predictions ({n_splits}-fold CV)",
     )
 
-    pipeline.fit(X, y)
+    pipeline.fit(X_train, y_train)
+
+    y_pred_test = pipeline.predict(X_test)
+    report_results(
+        y_test,
+        y_pred_test,
+        class_names,
+        title="Test set: held-out evaluation",
+    )
     return pipeline
 
 
@@ -443,13 +462,27 @@ def main() -> None:
     X, y, label_encoder = build_feature_matrix(reps)
     class_names = list(label_encoder.classes_)
 
+    _section("Train/test split")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y,
+    )
+    print(
+        f"Train size: {len(y_train)} reps | Test size: {len(y_test)} reps "
+        f"(test_size={TEST_SIZE})",
+        flush=True,
+    )
+
     models = get_models()
-    scores, best_name = evaluate_with_cv(X, y, models, n_splits=N_CV_FOLDS)
+    scores, best_name = evaluate_with_cv(X_train, y_train, models, n_splits=N_CV_FOLDS)
 
     param_grid = get_param_grid(best_name)
     tuned_pipeline = tune_best_model(
-        X,
-        y,
+        X_train,
+        y_train,
         models[best_name],
         param_grid,
         cv=N_GRIDSEARCH_FOLDS,
@@ -457,8 +490,10 @@ def main() -> None:
 
     fitted_pipeline = evaluate_final_model(
         tuned_pipeline,
-        X,
-        y,
+        X_train,
+        y_train,
+        X_test,
+        y_test,
         class_names,
         n_splits=N_CV_FOLDS,
     )

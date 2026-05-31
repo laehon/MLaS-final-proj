@@ -35,26 +35,27 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
 
+from features import (
+    IMU_COLUMNS,
+    N_FEATURES,
+    SAMPLE_RATE_HZ,
+    extract_features,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("./data")
 CLASSES = ["bump", "spike", "set", "serve"]
-IMU_COLUMNS = ["ax", "ay", "az", "gx", "gy", "gz"]
 RANDOM_STATE = 42
-MODEL_SAVE_PATH = Path("./artifacts/pipeline.joblib")
-SAMPLE_RATE_HZ = 100
+# Standalone model file for inference (see predict.py). Not mixed with eval plots.
+MODEL_SAVE_PATH = Path("models/volleyball_classifier.joblib")
+ARTIFACTS_DIR = Path("./artifacts")
 N_CV_FOLDS = 5
 N_GRIDSEARCH_FOLDS = 3
 # Parallel workers can interleave stdout on Windows; keep at 1 for clean console output.
 N_JOBS = 1
 TEST_SIZE = 0.2
-
-# Per-axis: 5 time features + 4 frequency summary features
-N_TIME_FEATURES_PER_AXIS = 5
-N_FREQ_FEATURES_PER_AXIS = 4
-N_FEATURES_PER_AXIS = N_TIME_FEATURES_PER_AXIS + N_FREQ_FEATURES_PER_AXIS
-N_FEATURES = len(IMU_COLUMNS) * N_FEATURES_PER_AXIS
 
 FILENAME_PATTERN = re.compile(r"^(bump|spike|set|serve)_\d+\.csv$", re.IGNORECASE)
 MIN_SAMPLES_PER_REP = 50
@@ -133,62 +134,6 @@ def inspect_dataset(reps: list[tuple[np.ndarray, str]]) -> None:
             f"\nWarning: {len(short_reps)} repetition(s) shorter than 90% of "
             f"median length ({median_len} samples)."
         )
-
-
-def _time_domain_features(axis: np.ndarray) -> np.ndarray:
-    """Mean, std, min, max, and signal magnitude area for one axis."""
-    sma = np.sum(np.abs(axis)) / len(axis)
-    return np.array([np.mean(axis), np.std(axis), np.min(axis), np.max(axis), sma])
-
-
-def _frequency_domain_features(axis: np.ndarray) -> np.ndarray:
-    """
-    FFT magnitude summary features for one axis.
-
-    Returns dominant frequency (Hz), total spectral energy, mean magnitude,
-    and std of the one-sided magnitude spectrum.
-    """
-    centered = axis - np.mean(axis)
-    spectrum = np.fft.rfft(centered)
-    magnitudes = np.abs(spectrum)
-    freqs = np.fft.rfftfreq(len(centered), d=1.0 / SAMPLE_RATE_HZ)
-
-    dominant_idx = int(np.argmax(magnitudes[1:])) + 1 if len(magnitudes) > 1 else 0
-    dominant_freq = freqs[dominant_idx]
-
-    return np.array(
-        [
-            dominant_freq,
-            np.sum(magnitudes**2),
-            np.mean(magnitudes),
-            np.std(magnitudes),
-        ]
-    )
-
-
-def extract_features(imu_window: np.ndarray) -> np.ndarray:
-    """
-    Build one fixed-size feature vector for a single repetition.
-
-    Args:
-        imu_window: Array of shape (n_samples, 6) for ax..gz.
-
-    Returns:
-        1D array of shape (N_FEATURES,) — 54 features (9 per axis × 6 axes).
-    """
-    if imu_window.ndim != 2 or imu_window.shape[1] != len(IMU_COLUMNS):
-        raise ValueError(
-            f"Expected imu_window shape (n_samples, {len(IMU_COLUMNS)}), "
-            f"got {imu_window.shape}"
-        )
-
-    features = []
-    for col_idx in range(len(IMU_COLUMNS)):
-        axis = imu_window[:, col_idx]
-        features.append(_time_domain_features(axis))
-        features.append(_frequency_domain_features(axis))
-
-    return np.concatenate(features)
 
 
 def build_feature_matrix(
@@ -370,10 +315,9 @@ def report_results(
     plt.xlabel("Predicted")
     plt.ylabel("True")
     plt.title(title)
-    artifacts_dir = Path("./artifacts")
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(artifacts_dir / "confusion_matrix.png", dpi=150)
+    plt.savefig(ARTIFACTS_DIR / "confusion_matrix.png", dpi=150)
     plt.close()
 
     bump_idx = class_names.index("bump")
@@ -397,14 +341,7 @@ def evaluate_final_model(
     class_names: list[str],
     n_splits: int = N_CV_FOLDS,
 ) -> Pipeline:
-    """
-    Evaluate on a held-out test set, then return a fitted pipeline.
-
-    Workflow:
-    - Cross-validated out-of-fold report on TRAIN only (sanity check)
-    - Fit on TRAIN
-    - Final evaluation on TEST (true hold-out)
-    """
+    """Evaluate on a held-out test set, then return a fitted pipeline."""
     cv = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
@@ -431,28 +368,31 @@ def evaluate_final_model(
     return pipeline
 
 
-def save_artifacts(
+def save_classifier(
     pipeline: Pipeline,
     label_encoder: LabelEncoder,
-    path: Path | str,
-) -> None:
+    path: Path | str = MODEL_SAVE_PATH,
+) -> Path:
     """
-    Save fitted pipeline and label encoder for live-demo.
+    Save the trained classifier to a standalone file for inference.
 
-    Live demo: capture IMU window -> extract_features -> pipeline.predict ->
-    label_encoder.inverse_transform.
+    Use predict.py to load this file without running training:
+        python predict.py data/bump_1.csv
     """
     save_path = Path(path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     artifact = {
         "pipeline": pipeline,
         "label_encoder": label_encoder,
+        "classes": list(label_encoder.classes_),
         "imu_columns": IMU_COLUMNS,
         "sample_rate_hz": SAMPLE_RATE_HZ,
         "n_features": N_FEATURES,
     }
     joblib.dump(artifact, save_path)
-    print(f"Saved model artifact to {save_path.resolve()}", flush=True)
+    print(f"Saved classifier to {save_path.resolve()}", flush=True)
+    print("Run inference with: python predict.py <path/to/window.csv>", flush=True)
+    return save_path
 
 
 def main() -> None:
@@ -498,7 +438,7 @@ def main() -> None:
         n_splits=N_CV_FOLDS,
     )
 
-    save_artifacts(fitted_pipeline, label_encoder, MODEL_SAVE_PATH)
+    save_classifier(fitted_pipeline, label_encoder)
 
     _section("Training summary")
     for name, result in scores.items():
